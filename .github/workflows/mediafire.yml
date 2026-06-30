@@ -1,0 +1,51 @@
+name: MediaFire to GitHub Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      mediafire_url:
+        description: 'Enter MediaFire Download Link'
+        required: true
+        type: string
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install mediafire-dl
+      run: |
+        pip install git+https://github.com/Juvenal-Y/mediafire-dl.git
+
+    - name: Download File from MediaFire
+      run: |
+        mediafire-dl "${{ github.event.inputs.mediafire_url }}"
+
+    - name: Split File into 2GB Chunks
+      run: |
+        # این دستور تمام فایل‌های دانلود شده را به تکه‌های ۲ گیگابایتی تقسیم می‌کند تا با قوانین گیت‌هاب همخوانی داشته باشد
+        mkdir split_files
+        for file in *.*; do
+          if [ -f "$file" ] && [ "$file" != "requirements.txt" ]; then
+            split -b 2000M "$file" "split_files/${file}.part_"
+          fi
+        done
+
+    - name: Upload to GitHub Releases
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: "v${{ github.run_number }}"
+        name: "GTA V Update Part ${{ github.run_number }}"
+        files: split_files/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
