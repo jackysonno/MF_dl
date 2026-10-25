@@ -1,0 +1,217 @@
+name: Download, Split & Upload to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: '🔗 VikingFile page URL OR direct S3 URL'
+        required: true
+        type: string
+      part_size_mb:
+        description: '📦 Part size in MB (max 1990)'
+        required: false
+        default: '1800'
+        type: string
+      release_tag:
+        description: '🏷️ Release tag (leave empty to auto-generate)'
+        required: false
+        default: ''
+        type: string
+      file_extension:
+        description: '📄 File extension for parts (e.g. .pkg)'
+        required: false
+        default: '.pkg'
+        type: string
+
+jobs:
+  download-split-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android 2>/dev/null || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 jq
+
+      - name: Resolve direct download URL
+        id: resolve
+        env:
+          INPUT_URL: ${{ inputs.page_url }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "🔍 Input URL: $INPUT_URL"
+
+          # اگر لینک از قبل S3/direct است، همان را استفاده کن
+          if echo "$INPUT_URL" | grep -qE '\.(s3|r2)\.|amazonaws\.com|\.bhs\.io\.cloud\.ovh\.net'; then
+            echo "✅ URL is already a direct link"
+            echo "direct_url=$INPUT_URL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "🌐 Fetching page: $INPUT_URL"
+          PAGE_HTML=$(curl -sL --retry 5 --retry-delay 3 \
+            --connect-timeout 30 --max-time 120 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" \
+            "$INPUT_URL")
+
+          if [ -z "$PAGE_HTML" ]; then
+            echo "❌ Could not fetch page (empty response)"
+            exit 1
+          fi
+
+          echo "📄 Page size: $(echo -n "$PAGE_HTML" | wc -c) bytes"
+
+          # چند الگوی ممکن برای استخراج لینک مستقیم
+          DIRECT=""
+          # الگوی 1: مقدار داخل "downloadUrl" یا "download_url" یا "direct_url"
+          DIRECT=$(echo "$PAGE_HTML" | grep -oE '"(downloadUrl|download_url|direct_url|url)"\s*:\s*"[^"]+"' | head -1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
+          # الگوی 2: هر URL که به s3 یا bhs ختم شود
+          if [ -z "$DIRECT" ]; then
+            DIRECT=$(echo "$PAGE_HTML" | grep -oE 'https://[a-zA-Z0-9./_-]*(s3|bhs)[a-zA-Z0-9./_?=&%:-]+' | head -1)
+          fi
+          # الگوی 3: هر URL داخل "source" یا "link"
+          if [ -z "$DIRECT" ]; then
+            DIRECT=$(echo "$PAGE_HTML" | grep -oE 'https://[^"'"'"' ]+\.pkg[^"'"'"' ]*' | head -1)
+          fi
+
+          # بررسی نهایی
+          if [ -z "$DIRECT" ]; then
+            echo "❌ Could not extract direct link from page"
+            echo "📄 First 2000 chars of page (for debugging):"
+            echo "$PAGE_HTML" | head -c 2000
+            exit 1
+          fi
+
+          # تبدیل کاراکترهای escape شده
+          DIRECT=$(echo "$DIRECT" | sed 's/\\u0026/\&/g; s/\\\//\//g')
+          echo "✅ Extracted direct URL: $DIRECT"
+          echo "direct_url=$DIRECT" >> "$GITHUB_OUTPUT"
+
+      - name: Download, split & upload incrementally
+        env:
+          URL: ${{ steps.resolve.outputs.direct_url }}
+          PART_MB: ${{ inputs.part_size_mb }}
+          EXT: ${{ inputs.file_extension }}
+          TAG: ${{ inputs.release_tag || format('release-{0}', github.run_number) }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          PART_BYTES=$((PART_MB * 1024 * 1024))
+          echo "📦 Part size: ${PART_MB} MB"
+          echo "🏷️  Release tag: $TAG"
+          echo "🔗 Download URL: $URL"
+
+          # --- بررسی اندازه فایل (اختیاری، بدون خطا در صورت شکست) ---
+          echo "🔍 Trying to detect file size (optional)..."
+          EXPECTED_BYTES=$(curl -sIL --retry 2 --connect-timeout 15 --max-time 30 "$URL" 2>/dev/null \
+            | grep -i '^content-length:' | tail -1 | awk '{print $2}' | tr -d '\r' || true)
+
+          if [[ -z "${EXPECTED_BYTES:-}" ]] || ! [[ "$EXPECTED_BYTES" =~ ^[0-9]+$ ]]; then
+            echo "⚠️  Could not determine file size — proceeding anyway"
+            EXPECTED_BYTES=0
+          else
+            echo "📏 Expected file size: $(numfmt --to=iec "$EXPECTED_BYTES" 2>/dev/null || echo "$EXPECTED_BYTES bytes")"
+          fi
+
+          # --- بررسی فضای دیسک ---
+          AVAIL=$(df --output=avail -B1 / | tail -1 | tr -d ' ')
+          NEEDED=$((PART_BYTES * 2))
+          if [ "$AVAIL" -lt "$NEEDED" ]; then
+            echo "❌ Not enough disk: avail=$AVAIL, need=$NEEDED"
+            exit 1
+          fi
+          echo "💾 Disk OK: $(numfmt --to=iec "$AVAIL") available"
+
+          # --- ساخت Release ---
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "Release $TAG" \
+            --notes "Automated upload. To merge parts: cat game*${EXT}.part* > final${EXT}" \
+            --target "$(git rev-parse HEAD)" 2>&1 || {
+              echo "⚠️  Release may already exist, continuing..."
+            }
+          echo "✅ Release ready: $TAG"
+
+          # --- شروع دانلود و تقسیم همزمان ---
+          echo "⬇️  Starting download+split stream..."
+          ( curl -sL --retry 10 --retry-delay 10 --retry-connrefused \
+                 --connect-timeout 60 --max-time 21600 \
+                 -o - "$URL" \
+              | split -b "${PART_MB}M" - "part_" ) &
+          PIPE_PID=$!
+
+          # --- آپلود تدریجی ---
+          UPLOADED_LIST=$(mktemp)
+          TOTAL_UPLOADED=0
+          PART_INDEX=0
+
+          while kill -0 "$PIPE_PID" 2>/dev/null; do
+            for f in part_*; do
+              [ -f "$f" ] || continue
+              grep -qxF "$f" "$UPLOADED_LIST" && continue
+
+              size=$(stat -c%s "$f")
+              # فقط قطعاتی که به اندازه کامل رسیده‌اند
+              if [ "$size" -ge "$PART_BYTES" ]; then
+                PART_INDEX=$((PART_INDEX + 1))
+                RENAMED=$(printf "game%s.part%03d" "$EXT" "$PART_INDEX")
+                mv "$f" "$RENAMED"
+
+                echo "📤 Uploading $RENAMED ($(numfmt --to=iec "$size"))..."
+                if gh release upload "$TAG" "$RENAMED" --repo "$REPO" --clobber; then
+                  echo "$RENAMED" >> "$UPLOADED_LIST"
+                  TOTAL_UPLOADED=$((TOTAL_UPLOADED + size))
+                  rm -f "$RENAMED"
+                  echo "   ✔ Progress: $(numfmt --to=iec "$TOTAL_UPLOADED")"
+                else
+                  echo "   ❌ Upload failed for $RENAMED"
+                fi
+              fi
+            done
+            sleep 15
+          done
+
+          wait "$PIPE_PID" 2>/dev/null || true
+
+          # --- آپلود آخرین قطعه (کوچک‌تر) ---
+          for f in part_*; do
+            [ -f "$f" ] || continue
+            grep -qxF "$f" "$UPLOADED_LIST" && continue
+            size=$(stat -c%s "$f")
+            if [ "$size" -eq 0 ]; then rm -f "$f"; continue; fi
+            PART_INDEX=$((PART_INDEX + 1))
+            RENAMED=$(printf "game%s.part%03d" "$EXT" "$PART_INDEX")
+            mv "$f" "$RENAMED"
+            echo "📤 Uploading final part $RENAMED ($(numfmt --to=iec "$size"))..."
+            gh release upload "$TAG" "$RENAMED" --repo "$REPO" --clobber
+            TOTAL_UPLOADED=$((TOTAL_UPLOADED + size))
+            rm -f "$RENAMED"
+          done
+
+          # --- اعتبارسنجی نهایی ---
+          echo "═══════════════════════════════"
+          echo "📊 Total uploaded: $(numfmt --to=iec "$TOTAL_UPLOADED")"
+          if [ "$EXPECTED_BYTES" -gt 0 ]; then
+            echo "📊 Expected:      $(numfmt --to=iec "$EXPECTED_BYTES")"
+            if [ "$TOTAL_UPLOADED" -ne "$EXPECTED_BYTES" ]; then
+              echo "⚠️  Size mismatch — download may have been interrupted"
+            else
+              echo "✅ Size matches perfectly!"
+            fi
+          fi
+          echo "✅ Done! Release: https://github.com/$REPO/releases/tag/$TAG"
